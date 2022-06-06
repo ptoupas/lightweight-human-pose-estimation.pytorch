@@ -1,8 +1,10 @@
-import tensorrt as trt
-import numpy as np
 import time
-import pycuda.driver as cuda
+from typing import Tuple
+
+import numpy as np
 import pycuda.autoinit
+import pycuda.driver as cuda
+import tensorrt as trt
 
 
 class ONNXClassifierWrapper():
@@ -66,27 +68,28 @@ class HostDeviceMem(object):
 
 class TrtModel:
 
-    def __init__(self, engine_path, max_batch_size: int = 1, dtype=np.float32):
+    def __init__(self, engine_path: str, max_batch_size: int = 1, dtype=np.float32) -> None:
 
         self.engine_path = engine_path
         self.dtype = dtype
+        self.max_batch_size = max_batch_size
+        self.cuda_ctx = cuda.Device(0).make_context()
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.logger)
         self.engine = self.load_engine(self.runtime, self.engine_path)
-        self.max_batch_size = max_batch_size
+        self.context = self.engine.create_execution_context()
         self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers(
         )
-        self.context = self.engine.create_execution_context()
 
     @staticmethod
-    def load_engine(trt_runtime, engine_path):
+    def load_engine(trt_runtime: trt.Runtime, engine_path: str) -> trt.ICudaEngine:
         trt.init_libnvinfer_plugins(None, "")
         with open(engine_path, 'rb') as f:
             engine_data = f.read()
         engine = trt_runtime.deserialize_cuda_engine(engine_data)
         return engine
 
-    def allocate_buffers(self):
+    def allocate_buffers(self) -> Tuple[list, list, list, cuda.Stream]:
 
         inputs = []
         outputs = []
@@ -108,46 +111,72 @@ class TrtModel:
 
         return inputs, outputs, bindings, stream
 
-    def __call__(self, x: np.ndarray, batch_size: int = 1):
+    def __del__(self) -> None:
+        """Free CUDA memories."""
+        del self.outputs
+        del self.inputs
+        del self.stream
+
+    def __call__(self, x: np.ndarray, batch_size: int = 1) -> list:
         x = x.astype(self.dtype)
         np.copyto(self.inputs[0].host, x.ravel())
 
-        for inp in self.inputs:
-            cuda.memcpy_htod_async(inp.device, inp.host, self.stream)
+        if self.cuda_ctx:
+            self.cuda_ctx.push()
 
-        self.context.execute_async(batch_size=batch_size,
-                                   bindings=self.bindings,
-                                   stream_handle=self.stream.handle)
-        for out in self.outputs:
-            cuda.memcpy_dtoh_async(out.host, out.device, self.stream)
+        context = self.context
+        bindings = self.bindings
+        inputs = self.inputs
+        outputs = self.outputs
+        stream = self.stream
 
-        self.stream.synchronize()
-        return [out.host.reshape(batch_size, -1) for out in self.outputs]
+        for inp in inputs:
+            cuda.memcpy_htod_async(inp.device, inp.host, stream)
+
+        # For TensorRT < 7.0
+        # context.execute_async(batch_size=batch_size,
+        #                            bindings=bindings,
+        #                            stream_handle=stream.handle)
+        # For TensorRT >= 7.0
+        context.execute_async_v2(bindings=bindings,
+                                   stream_handle=stream.handle)
+
+        for out in outputs:
+            cuda.memcpy_dtoh_async(out.host, out.device, stream)
+
+        stream.synchronize()
+                
+        del context
+
+        if self.cuda_ctx:
+            self.cuda_ctx.pop()
+
+        return [out.host.reshape(batch_size, -1) for out in outputs]
 
 
 if __name__ == "__main__":
-    # trt_inf = TrtModel("x3d_m_7_fp16.engine",
-    #                    max_batch_size=1,
-    #                    dtype=np.float16)
-
-    # start = time.time()
-    # for _ in range(300):
-    #     dummy_input = np.random.rand(1, 3, 16, 256, 256).astype(np.float16)
-    #     out = trt_inf(dummy_input, 1)
-    # end = time.time()
-    # print(
-    #     f"Time taken: {end - start}. Time per invocation: {(end - start) / 300}"
-    # )
-
-    trt_inf = ONNXClassifierWrapper("x3d_m_7_fp32.engine",
-                                    num_classes=[1, 7],
-                                    target_dtype=np.float32)
+    trt_inf = TrtModel("x3d_m_7_fp32.engine",
+                       max_batch_size=1,
+                       dtype=np.float32)
 
     start = time.time()
     for _ in range(300):
         dummy_input = np.random.rand(1, 3, 16, 256, 256).astype(np.float32)
-        out = trt_inf.predict(dummy_input)
+        out = trt_inf(dummy_input, 1)
     end = time.time()
+    print(
+        f"Time taken: {end - start}. Time per invocation: {(end - start) / 300}"
+    )
+
+    # trt_inf = ONNXClassifierWrapper("x3d_m_7_fp32.engine",
+    #                                 num_classes=[1, 7],
+    #                                 target_dtype=np.float32)
+    # start = time.time()
+    # for _ in range(300):
+    #     dummy_input = np.random.rand(1, 3, 16, 256, 256).astype(np.float32)
+    #     out = trt_inf.predict(dummy_input)
+    # end = time.time()
+
     print(
         f"Time taken: {end - start}. Time per invocation: {(end - start) / 300}"
     )

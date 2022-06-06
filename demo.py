@@ -1,10 +1,10 @@
 import argparse
+import math
+import time
 
 import cv2
 import numpy as np
 import torch
-import math
-import time
 
 from models.with_mobilenet import PoseEstimationWithMobileNet
 from modules.keypoints import extract_keypoints, group_keypoints
@@ -302,7 +302,7 @@ if __name__ == '__main__':
                  args.smooth)
     else:
         trt_model = TrtModel(
-            "checkpoints/pose_estimation_with_mobilenet_fp16.engine",
+            "checkpoints/pose_estimation_with_mobilenet_fp32.engine",
             max_batch_size=1,
             dtype=np.float32)
         run_demo(trt_model,
